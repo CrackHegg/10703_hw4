@@ -295,7 +295,7 @@ class TrainDiffusionPolicy:
         loss = torch.nn.MSELoss()(predicted_noise[valid], noise[valid])
         loss.backward()
         self.optimizer.step()
-        loss = float(loss.detach().cpu().item())
+        loss = loss.detach().cpu().item()
         # END STUDENT SOLUTION
 
         return loss
@@ -404,7 +404,7 @@ def run_training():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    model = PolicyDiffusionTransformer(num_transformer_layers=6, state_dim=state_dim, act_dim=action_dim, hidden_size=128, n_transformer_heads=1)
+    model = PolicyDiffusionTransformer(num_transformer_layers=6, state_dim=state_dim, act_dim=action_dim, hidden_size=128, n_transformer_heads=1, device=device)
     optimizer = torch.optim.AdamW(params = model.parameters(), lr=0.00005, weight_decay=0.001)
     trainer = TrainDiffusionPolicy(env=env, model=model, optimizer=optimizer, states_array=states, actions_array=actions, device=device)
     trainer.train(num_training_steps=50000, batch_size=256, save_every=50000, wandb_logging=True)
