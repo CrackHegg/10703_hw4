@@ -129,7 +129,25 @@ class TrainDiffusionPolicy:
         NOTE: remember that you are predicting max_action_len actions, not just one
         """
         # BEGIN STUDENT SOLUTION
-
+        batch_size = previous_states.shape[0]
+        action_dim = previous_actions.shape[-1]
+        x_t = torch.randn((batch_size, max_action_len, action_dim), device=self.device)
+        timesteps = self.get_inference_timesteps()
+        for t in timesteps:
+            noise_levels = torch.full((batch_size, 1), int(t), device=self.device, dtype=torch.long)
+            predicted_noise = self.model(
+                previous_states,
+                previous_actions,
+                x_t,
+                episode_timesteps,
+                noise_levels,
+                previous_states_padding_mask,
+                previous_actions_padding_mask,
+                actions_padding_mask,
+            )
+            # the scheduler applies the DDPM update and adds sigma_t * z (z = 0 at the last step)
+            x_t = self.inference_scheduler.step(predicted_noise, t, x_t).prev_sample
+        predicted_actions = x_t
         # END STUDENT SOLUTION
         return predicted_actions
 
@@ -158,7 +176,51 @@ class TrainDiffusionPolicy:
         """
         rewards, rgbs = np.zeros((self.max_trajectory_length,)), []
         # BEGIN STUDENT SOLUTION
+        obs, _ = env.reset()
+        states = [(obs - self.states_mean) / self.states_std]
+        actions = []
+        timesteps = [0]
+        done, truncated = False, False
+        step = 0
+        if render:
+            rgbs.append(env.render())
+        K = num_previous_states
+        with torch.no_grad():
+            while not done and not truncated and step < self.max_trajectory_length:
+                n_s, n_a = len(states), len(actions)
+                # pad at the end, mask is True for padded entries (same layout as get_training_batch)
+                prev_states = np.zeros((K, states[0].shape[0]))
+                prev_states[:n_s] = np.stack(states)
+                prev_actions = np.zeros((num_previous_actions, self.actions_mean.shape[0]))
+                if n_a > 0:
+                    prev_actions[:n_a] = np.stack(actions)
+                states_pad = np.arange(K) >= n_s
+                actions_pad = np.arange(num_previous_actions) >= n_a
+                ep_timesteps = timesteps[0] + np.arange(K)
 
+                predicted = self.diffusion_sample(
+                    torch.from_numpy(prev_states).float().unsqueeze(0).to(self.device),
+                    torch.from_numpy(prev_actions).float().unsqueeze(0).to(self.device),
+                    torch.from_numpy(ep_timesteps).long().unsqueeze(0).to(self.device),
+                    torch.from_numpy(states_pad).bool().unsqueeze(0).to(self.device),
+                    torch.from_numpy(actions_pad).bool().unsqueeze(0).to(self.device),
+                    torch.zeros((1, 3), dtype=torch.bool, device=self.device),
+                )[0].cpu().numpy()
+
+                for i in range(num_actions_to_eval_in_a_row):
+                    env_action = predicted[i] * self.actions_std + self.actions_mean
+                    new_state, reward, done, truncated, _ = env.step(env_action)
+                    rewards[step] = reward
+                    step += 1
+                    if render:
+                        rgbs.append(env.render())
+                    if done or truncated or step >= self.max_trajectory_length:
+                        return rewards, rgbs
+                    states.append((new_state - self.states_mean) / self.states_std)
+                    actions.append(predicted[i])
+                    timesteps.append(timesteps[-1] + 1)
+                    # context length is at most K states, K-1 actions
+                    states, actions, timesteps = states[-K:], actions[-(K - 1):], timesteps[-K:]
         # END STUDENT SOLUTION
         return rewards, rgbs
 
@@ -187,14 +249,18 @@ class TrainDiffusionPolicy:
         self.model.eval() # turn on eval mode (this turns off dropout, running_mean, etc. that are used in training)
 
         rewards = np.zeros((num_samples, self.max_trajectory_length))
+        times = []
         os.makedirs("data/diffusion_policy_trajectories", exist_ok=True)
         for sample_trajectory in tqdm(range(num_samples)):
             time1 = time.time()
             reward, _ = self.sample_trajectory(self.env, num_actions_to_eval_in_a_row=num_actions_to_eval_in_a_row)
             time2 = time.time()
+            times.append(time2 - time1)
             print(f"trajectory {sample_trajectory} took {time2 - time1} seconds")
             rewards[sample_trajectory] = reward
             print(f"rewards from trajectory {sample_trajectory}={reward.sum()}")
+        print(f"num_actions_to_eval_in_a_row={num_actions_to_eval_in_a_row}")
+        print(f"average time per trajectory={np.mean(times)} seconds")
         print(f"average reward per trajectory={rewards.sum() / (rewards.shape[0])}")
         print(f"median reward per trajectory={np.median(rewards.sum(axis=1))}")
         print(f"max reward per trajectory={np.max(rewards.sum(axis=1))}")
@@ -408,6 +474,8 @@ def run_training():
     optimizer = torch.optim.AdamW(params = model.parameters(), lr=0.00005, weight_decay=0.001)
     trainer = TrainDiffusionPolicy(env=env, model=model, optimizer=optimizer, states_array=states, actions_array=actions, device=device)
     trainer.train(num_training_steps=50000, batch_size=256, save_every=50000, wandb_logging=True)
+    for n in [1, 2, 3]:
+        trainer.evaluation(num_samples=20, num_actions_to_eval_in_a_row=n)
     # END STUDENT SOLUTION
     trainer.evaluation(num_samples=30)
     traj_reward = 0
